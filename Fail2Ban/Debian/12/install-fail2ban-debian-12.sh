@@ -6,7 +6,8 @@
 # - detects firewall backend (nftables, ufw, iptables) and chooses a compatible banaction
 # - detects primary IPv4 of the VPS and adds it to ignoreip
 # - creates a safe /etc/fail2ban/jail.local with recommended defaults
-# - validates configuration, ensures runtime dir, retries service start and captures diagnostics if needed
+# - validates configuration, ensures runtime dir, ensures /var/log/auth.log exists when missing
+# - retries service start and captures diagnostics if needed
 #
 # Run as root or via sudo.
 set -euo pipefail
@@ -152,6 +153,24 @@ ensure_runtime_dir() {
   fi
 }
 
+ensure_auth_log() {
+  # Some systems use only journald and never create /var/log/auth.log.
+  # Creating a placeholder prevents fail2ban from failing when other config references auth.log.
+  local f=/var/log/auth.log
+  if [ ! -e "$f" ]; then
+    touch "$f"
+    # Prefer group 'adm' if present (Debian default), else keep root
+    if getent group adm >/dev/null 2>&1; then
+      chown root:adm "$f" || true
+      chmod 0640 "$f" || true
+    else
+      chown root:root "$f" || true
+      chmod 0600 "$f" || true
+    fi
+    echo "Created placeholder $f"
+  fi
+}
+
 service_start_and_check() {
   local install_log=/var/log/fail2ban-install.log
   : > "$install_log"
@@ -233,6 +252,7 @@ main() {
   fi
 
   ensure_runtime_dir
+  ensure_auth_log
 
   # Start and verify
   if ! service_start_and_check; then
