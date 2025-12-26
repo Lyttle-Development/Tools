@@ -1,35 +1,35 @@
 #!/usr/bin/env bash
-# install-fail2ban-debian-13.sh
-# Idempotent installer and configurator for fail2ban on Debian 13 (trixie).
+# install-fail2ban-debian.sh
+# Idempotent installer and configurator for fail2ban on Debian (all versions:  10/11/12/13+).
 #
 # Fixes for minimal/journald-only VPS images:
 # - installs fail2ban WITH recommended dependencies (python3-systemd / pyinotify) so journald backend works reliably
 # - ensures /var/log/auth.log exists (placeholder) for configs that expect it
-# - prefers journalmode + journalmatch for sshd when auth.log isn't present
+# - prefers journalmode + journalmatch for sshd when auth. log isn't present
 # - ensures runtime and DB directories exist
 # - validates configuration and captures diagnostics on failure
 # - starts fail2ban in daemon mode (not foreground -xf) to avoid systemd Type=simple exit-255 race
 #
-# Run as root or via sudo. 
+# Run as root or via sudo.
 set -euo pipefail
 
 timestamp() { date -u +"%Y%m%dT%H%M%SZ"; }
 
 require_root() {
   if [ "$(id -u)" -ne 0 ]; then
-    echo "This script must be run as root.   Use sudo." >&2
+    echo "This script must be run as root.  Use sudo." >&2
     exit 1
   fi
 }
 
-detect_debian_13() {
+detect_debian() {
   if [ -r /etc/os-release ]; then
     .  /etc/os-release
     if [ "${ID:-}" != "debian" ]; then
-      echo "Warning:  This script is targeted for Debian 13. Detected:  ${PRETTY_NAME:-$ID $VERSION_ID}" >&2
-    fi
-    if [ -n "${VERSION_ID:-}" ] && [ "${VERSION_ID:-}" != "13" ]; then
-      echo "Warning: This script is targeted for Debian 13. Detected version: ${VERSION_ID}" >&2
+      echo "Warning:  This script is for Debian only. Detected: ${PRETTY_NAME:-$ID $VERSION_ID}" >&2
+      echo "Continuing anyway..." >&2
+    else
+      echo "Detected:  ${PRETTY_NAME:-Debian $VERSION_ID}"
     fi
   fi
 }
@@ -63,7 +63,6 @@ detect_ssh_port() {
 }
 
 detect_banaction() {
-  # Prefer nftables on Debian 13, then ufw, else iptables-multiport
   if command -v nft >/dev/null 2>&1 && systemctl is-active --quiet nftables 2>/dev/null; then
     echo "nftables-multiport"
     return
@@ -86,16 +85,16 @@ backup_existing() {
 
 ensure_runtime_dir() {
   local dir=/run/fail2ban
-  if [ !  -d "$dir" ]; then
+  if [ ! -d "$dir" ]; then
     mkdir -p "$dir"
     chmod 0755 "$dir"
-    chown root: root "$dir" 2>/dev/null || true
+    chown root:root "$dir" 2>/dev/null || true
     echo "Created $dir"
   fi
 }
 
 ensure_auth_log() {
-  local f=/var/log/auth.log
+  local f=/var/log/auth. log
   if [ ! -e "$f" ]; then
     touch "$f"
     if getent group adm >/dev/null 2>&1; then
@@ -128,7 +127,7 @@ write_jail_local() {
   backup_existing "$jail_local"
 
   local use_auth_log=0
-  if [ -r /var/log/auth. log ] && [ -s /var/log/auth.log ]; then
+  if [ -r /var/log/auth.log ] && [ -s /var/log/auth.log ]; then
     use_auth_log=1
   fi
 
@@ -172,12 +171,11 @@ validate_config() {
   echo "Validating fail2ban configuration..."
   if ! fail2ban-server -t 2>&1 | tee /tmp/fail2ban-config-test.log; then
     echo "fail2ban configuration test failed. See /tmp/fail2ban-config-test.log" >&2
-    cat /tmp/fail2ban-config-test.log >&2
+    cat /tmp/fail2ban-config-test. log >&2
     exit 1
   fi
 }
 
-# Override systemd unit to use daemon mode (background) instead of foreground
 fix_systemd_unit() {
   local override_dir=/etc/systemd/system/fail2ban.service.d
   local override_file="$override_dir/override.conf"
@@ -189,14 +187,14 @@ fix_systemd_unit() {
 # Override ExecStart to use daemon mode (background) instead of foreground -xf
 # This prevents the exit-255 race condition with systemd Type=simple
 ExecStart=
-ExecStart=/usr/bin/fail2ban-server -s /run/fail2ban/fail2ban.sock -p /run/fail2ban/fail2ban.pid start
+ExecStart=/usr/bin/fail2ban-server -s /run/fail2ban/fail2ban. sock -p /run/fail2ban/fail2ban.pid start
 EOF
   
   echo "Created systemd override at $override_file"
 }
 
 service_start_and_check() {
-  local install_log=/var/log/fail2ban-install. log
+  local install_log=/var/log/fail2ban-install.log
   : > "$install_log"
 
   systemctl daemon-reload
@@ -222,7 +220,7 @@ service_start_and_check() {
   journalctl -u fail2ban -b --no-pager -n 600 2>&1 | tee -a "$install_log"
 
   echo "---- /etc/fail2ban/jail.local ----" | tee -a "$install_log"
-  sed -n '1,200p' /etc/fail2ban/jail.local 2>&1 | tee -a "$install_log"
+  sed -n '1,200p' /etc/fail2ban/jail. local 2>&1 | tee -a "$install_log"
 
   echo "Diagnostics saved to $install_log" >&2
   echo "---- tail of $install_log ----"
@@ -244,7 +242,7 @@ post_install_checks() {
 
 main() {
   require_root
-  detect_debian_13
+  detect_debian
 
   echo "Installing fail2ban..."
   apt_install
@@ -273,7 +271,7 @@ main() {
   fix_systemd_unit
 
   if !  service_start_and_check; then
-    echo "Failed to start fail2ban. Check /var/log/fail2ban-install.log for details." >&2
+    echo "Failed to start fail2ban. Check /var/log/fail2ban-install. log for details." >&2
     exit 1
   fi
 
