@@ -8,25 +8,25 @@
 # - prefers journalmode + journalmatch for sshd when auth.log isn't present
 # - ensures runtime and DB directories exist
 # - validates configuration and captures diagnostics on failure
+# - starts fail2ban in daemon mode (not foreground -xf) to avoid systemd Type=simple exit-255 race
 #
-# Run as root or via sudo.
+# Run as root or via sudo. 
 set -euo pipefail
 
 timestamp() { date -u +"%Y%m%dT%H%M%SZ"; }
 
 require_root() {
   if [ "$(id -u)" -ne 0 ]; then
-    echo "This script must be run as root. Use sudo." >&2
+    echo "This script must be run as root.  Use sudo." >&2
     exit 1
   fi
 }
 
 detect_debian_12() {
   if [ -r /etc/os-release ]; then
-    . /etc/os-release
+    .  /etc/os-release
     if [ "${ID:-}" != "debian" ] || [ "${VERSION_ID:-}" != "12" ]; then
-      echo "Warning: This script is targeted for Debian 12. Detected: ${PRETTY_NAME:-$ID $VERSION_ID}" >&2
-      # continue anyway
+      echo "Warning: This script is targeted for Debian 12. Detected:  ${PRETTY_NAME:-$ID $VERSION_ID}" >&2
     fi
   fi
 }
@@ -34,11 +34,6 @@ detect_debian_12() {
 apt_install() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-
-  # Install fail2ban plus recommended runtime integrations for Debian 12:
-  # - python3-systemd: reliable systemd journal backend
-  # - python3-pyinotify: file change monitoring (log backends)
-  # - whois: used by some actions for richer logging
   apt-get install -yq fail2ban python3-systemd python3-pyinotify whois || {
     echo "apt-get install failed" >&2
     exit 1
@@ -65,11 +60,11 @@ detect_ssh_port() {
 }
 
 detect_banaction() {
-  if command -v nft >/dev/null 2>&1 && systemctl is-active --quiet nftables; then
+  if command -v nft >/dev/null 2>&1 && systemctl is-active --quiet nftables 2>/dev/null; then
     echo "nftables-multiport"
     return
   fi
-  if command -v ufw >/dev/null 2>&1 && systemctl is-active --quiet ufw; then
+  if command -v ufw >/dev/null 2>&1 && systemctl is-active --quiet ufw 2>/dev/null; then
     echo "ufw"
     return
   fi
@@ -90,7 +85,7 @@ ensure_runtime_dir() {
   if [ ! -d "$dir" ]; then
     mkdir -p "$dir"
     chmod 0755 "$dir"
-    chown root:root "$dir" || true
+    chown root:root "$dir" 2>/dev/null || true
     echo "Created $dir"
   fi
 }
@@ -100,11 +95,11 @@ ensure_auth_log() {
   if [ ! -e "$f" ]; then
     touch "$f"
     if getent group adm >/dev/null 2>&1; then
-      chown root:adm "$f" || true
-      chmod 0640 "$f" || true
+      chown root:adm "$f" 2>/dev/null || true
+      chmod 0640 "$f" 2>/dev/null || true
     else
-      chown root:root "$f" || true
-      chmod 0600 "$f" || true
+      chown root:root "$f" 2>/dev/null || true
+      chmod 0600 "$f" 2>/dev/null || true
     fi
     echo "Created placeholder $f"
   fi
@@ -114,8 +109,8 @@ ensure_db_dir() {
   local dir=/var/lib/fail2ban
   if [ ! -d "$dir" ]; then
     mkdir -p "$dir"
-    chown root:root "$dir" || true
-    chmod 0755 "$dir" || true
+    chown root:root "$dir" 2>/dev/null || true
+    chmod 0755 "$dir" 2>/dev/null || true
     echo "Created $dir"
   fi
 }
@@ -130,7 +125,6 @@ write_jail_local() {
 
   local use_auth_log=0
   if [ -r /var/log/auth.log ] && [ -s /var/log/auth.log ]; then
-    # Only prefer auth.log if it exists AND has content; on journald-only systems it's empty forever.
     use_auth_log=1
   fi
 
@@ -140,10 +134,8 @@ bantime = 1d
 findtime = 10m
 maxretry = 5
 
-# Use systemd journal by default (requires python3-systemd)
 backend = systemd
 
-# Keep a DB file for persistence across restarts
 dbfile = /var/lib/fail2ban/fail2ban.sqlite3
 
 ignoreip = 127.0.0.1/8 ::1 ${server_ip}
@@ -160,13 +152,10 @@ EOF
 
   if [ "$use_auth_log" -eq 1 ]; then
     cat >> "$jail_local" <<'EOF'
-# Using rsyslog-auth log (non-empty)
 logpath = /var/log/auth.log
 EOF
   else
     cat >> "$jail_local" <<'EOF'
-# Using systemd journal (journald-only images / no rsyslog)
-# Explicit journalmatch avoids fail2ban trying to resolve %(sshd_log)s -> missing files.
 journalmatch = _SYSTEMD_UNIT=sshd.service + _COMM=sshd
 EOF
   fi
@@ -184,18 +173,35 @@ validate_config() {
   fi
 }
 
+# Override systemd unit to use daemon mode (background) instead of foreground
+fix_systemd_unit() {
+  local override_dir=/etc/systemd/system/fail2ban.service.d
+  local override_file="$override_dir/override.conf"
+  
+  mkdir -p "$override_dir"
+  
+  cat > "$override_file" <<'EOF'
+[Service]
+# Override ExecStart to use daemon mode (background) instead of foreground -xf
+# This prevents the exit-255 race condition with systemd Type=simple
+ExecStart=
+ExecStart=/usr/bin/fail2ban-server -s /run/fail2ban/fail2ban.sock -p /run/fail2ban/fail2ban.pid start
+EOF
+  
+  echo "Created systemd override at $override_file"
+}
+
 service_start_and_check() {
   local install_log=/var/log/fail2ban-install.log
   : > "$install_log"
 
-  systemctl daemon-reload || true
+  systemctl daemon-reload
 
-  # Restart (not just enable) to ensure it picks up any existing state/config changes
   systemctl enable fail2ban >/dev/null 2>&1 || true
   systemctl restart fail2ban >/dev/null 2>&1 || true
 
   local tries=0
-  local max_tries=20
+  local max_tries=25
   while [ $tries -lt $max_tries ]; do
     if fail2ban-client ping >/dev/null 2>&1; then
       echo "fail2ban running"
@@ -214,15 +220,6 @@ service_start_and_check() {
   echo "---- /etc/fail2ban/jail.local ----" | tee -a "$install_log"
   sed -n '1,200p' /etc/fail2ban/jail.local 2>&1 | tee -a "$install_log"
 
-  echo "Attempting foreground run to capture errors to $install_log" | tee -a "$install_log"
-  if command -v timeout >/dev/null 2>&1; then
-    timeout 8s fail2ban-server -xf start >>"$install_log" 2>&1 || true
-  else
-    nohup bash -c 'fail2ban-server -xf start' >>"$install_log" 2>&1 &
-    sleep 8
-    pkill -f "fail2ban-server -xf start" || true
-  fi
-
   echo "Diagnostics saved to $install_log" >&2
   echo "---- tail of $install_log ----"
   tail -n 160 "$install_log" || true
@@ -235,10 +232,10 @@ post_install_checks() {
   echo "fail2ban status:"
   fail2ban-client status || true
   echo
-  echo "sshd jail status (if present):"
+  echo "sshd jail status:"
   fail2ban-client status sshd || true
   echo
-  echo "To follow fail2ban logs: sudo journalctl -u fail2ban -f"
+  echo "To follow fail2ban logs:  sudo journalctl -u fail2ban -f"
 }
 
 main() {
@@ -269,7 +266,9 @@ main() {
   write_jail_local "${server_ip:-}" "${ssh_port}" "$banaction"
   validate_config
 
-  if ! service_start_and_check; then
+  fix_systemd_unit
+
+  if !  service_start_and_check; then
     echo "Failed to start fail2ban. Check /var/log/fail2ban-install.log for details." >&2
     exit 1
   fi
