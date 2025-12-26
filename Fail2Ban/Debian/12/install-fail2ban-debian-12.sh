@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# install-fail2ban-debian12.sh
+# install-fail2ban-debian-12.sh
 # Idempotent installer and configurator for fail2ban on Debian 12 (bookworm).
-# Enhancements:
-# - validates fail2ban configuration before starting
-# - creates runtime directory if missing
-# - retries service start and checks fail2ban socket
-# - captures diagnostics/logs on failure to /var/log/fail2ban-install.log
-# - retains previous behavior: detects firewall backend, primary IP, ssh port, writes /etc/fail2ban/jail.local
+# - backs up existing /etc/fail2ban/jail.local if present
+# - installs fail2ban
+# - detects firewall backend (nftables, ufw, iptables) and chooses a compatible banaction
+# - detects primary IPv4 of the VPS and adds it to ignoreip
+# - creates a safe /etc/fail2ban/jail.local with recommended defaults
+# - validates configuration, ensures runtime dir, retries service start and captures diagnostics if needed
+#
+# Run as root or via sudo.
 set -euo pipefail
 
 timestamp() { date -u +"%Y%m%dT%H%M%SZ"; }
@@ -22,7 +24,7 @@ detect_debian_12() {
   if [ -r /etc/os-release ]; then
     . /etc/os-release
     if [ "${ID:-}" != "debian" ] || [ "${VERSION_ID:-}" != "12" ]; then
-      echo "Warning: targeted for Debian 12. Detected: ${PRETTY_NAME:-$ID $VERSION_ID}" >&2
+      echo "Warning: This script is targeted for Debian 12. Detected: ${PRETTY_NAME:-$ID $VERSION_ID}" >&2
       # continue anyway
     fi
   fi
@@ -57,6 +59,7 @@ detect_ssh_port() {
 }
 
 detect_banaction() {
+  # Prefer nftables if active, then ufw, else iptables-multiport
   if command -v nft >/dev/null 2>&1 && systemctl is-active --quiet nftables; then
     echo "nftables-multiport"
     return
@@ -65,6 +68,7 @@ detect_banaction() {
     echo "ufw"
     return
   fi
+  # default to iptables-multiport (works with iptables-nft wrapper on Debian)
   echo "iptables-multiport"
 }
 
@@ -85,6 +89,14 @@ write_jail_local() {
 
   backup_existing "$jail_local"
 
+  # Determine sshd logging approach:
+  # - If /var/log/auth.log exists, use it (traditional rsyslog)
+  # - Else use a journalmatch for systemd journal
+  local sshd_use_logfile=0
+  if [ -r /var/log/auth.log ]; then
+    sshd_use_logfile=1
+  fi
+
   cat > "$jail_local" <<EOF
 [DEFAULT]
 # Ban settings
@@ -92,7 +104,7 @@ bantime = 1d
 findtime = 10m
 maxretry = 5
 
-# Use systemd journal on Debian 12 for robust log reading
+# Use systemd journal on Debian 12 for robust log reading (fail2ban will fall back to journalmatch when needed)
 backend = systemd
 
 # Whitelist trusted IPs - script auto-added server's primary IP below.
@@ -108,12 +120,25 @@ loglevel = INFO
 [sshd]
 enabled = true
 port = ${ssh_port}
-logpath = %(sshd_log)s
-maxretry = 5
 EOF
 
+  if [ "$sshd_use_logfile" -eq 1 ]; then
+    cat >> "$jail_local" <<'EOF'
+# Use the traditional auth log if present (rsyslog/syslog)
+logpath = /var/log/auth.log
+maxretry = 5
+EOF
+  else
+    cat >> "$jail_local" <<'EOF'
+# No traditional auth log found; use systemd journal match for sshd
+# This prevents "Have not found any log file for sshd jail" errors on systems without /var/log/auth.log
+journalmatch = _SYSTEMD_UNIT=sshd.service + _COMM=sshd
+maxretry = 5
+EOF
+  fi
+
   chmod 644 "$jail_local"
-  echo "Wrote $jail_local"
+  echo "Wrote $jail_local (sshd using $( [ "$sshd_use_logfile" -eq 1 ] && echo auth.log || echo systemd journal ))"
 }
 
 ensure_runtime_dir() {
@@ -135,7 +160,7 @@ service_start_and_check() {
 
   # Retry loop: wait for fail2ban-server to respond via fail2ban-client ping
   local tries=0
-  local max_tries=10
+  local max_tries=15
   local sleep_sec=1
   while [ $tries -lt $max_tries ]; do
     if fail2ban-client ping >/dev/null 2>&1; then
@@ -150,17 +175,14 @@ service_start_and_check() {
   echo "fail2ban service did not start within ${max_tries}s — collecting diagnostics..." | tee -a "$install_log"
   echo "---- systemctl status fail2ban ----" | tee -a "$install_log"
   systemctl status fail2ban -l --no-pager 2>&1 | tee -a "$install_log"
-  echo "---- journalctl -u fail2ban (last 200 lines) ----" | tee -a "$install_log"
-  journalctl -u fail2ban -b --no-pager -n 200 2>&1 | tee -a "$install_log"
+  echo "---- journalctl -u fail2ban (last 400 lines) ----" | tee -a "$install_log"
+  journalctl -u fail2ban -b --no-pager -n 400 2>&1 | tee -a "$install_log"
 
   # Try to run server in foreground to capture errors (non-blocking background redirect)
   echo "Attempting foreground run to capture errors to $install_log" | tee -a "$install_log"
-  # Start foreground server for a short period to capture startup errors, kill after 6s if still running.
-  # Using nohup so it doesn't die with the script; run with -xf (foreground & debug)
   if command -v fail2ban-server >/dev/null 2>&1; then
     nohup bash -c 'fail2ban-server -xf start' >>"$install_log" 2>&1 &
     sleep 6
-    # if still running, kill it (we only wanted startup output)
     pkill -f "fail2ban-server -xf start" || true
   fi
 
