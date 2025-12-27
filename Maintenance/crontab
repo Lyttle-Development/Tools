@@ -1,0 +1,2 @@
+0 0 * * * /etc/webmin/package-updates/update.pl
+0 0 * * * /home/server/maintenance.sh
