@@ -18,7 +18,9 @@ TEMP_CRONTAB=$(mktemp)
 curl -H 'Cache-Control: no-cache' -fsSL "$CRONTAB_URL" -o "$TEMP_CRONTAB"
 
 # Ensure the crontab file ends with a newline
-sed -i -e '$a\' "$TEMP_CRONTAB"
+if [ -n "$(tail -c1 "$TEMP_CRONTAB")" ]; then
+  echo "" >> "$TEMP_CRONTAB"
+fi
 
 echo "Setting the cronjob for the root user..."
 sudo crontab "$TEMP_CRONTAB"
